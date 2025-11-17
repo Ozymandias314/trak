@@ -541,9 +541,182 @@ class IterativeImageClassificationModelOutput(AbstractModelOutput):
         return (1 - ps).clone().detach().unsqueeze(-1)
 
 
+
+class ChempropClassificationModelOutput(AbstractModelOutput):
+    """
+    Implements TRAK's AbstractModelOutput for Chemprop binary classification.
+
+    Assumes the model outputs a single raw logit (g) per sample and the
+    standard training loss is Binary Cross-Entropy with Logits (BCEWithLogitsLoss).
+
+    Defines the model output function f(z; theta) = g(z; theta).
+    The corresponding output-to-loss gradient dL/df = sigmoid(g) - y.
+    """
+    def __init__(self) -> None:
+        """Initializes the ChempropClassificationModelOutput."""
+        super().__init__()
+
+    # The batch argument here corresponds to the (bmg, targets) tuple in chemprop
+    def get_output(self,
+                   model: Module,
+                   params: Iterable[ch.Tensor],     
+                   buffers: Iterable[ch.Tensor],
+                   bmg,
+                   labels: Tensor,
+                   ) -> ch.Tensor:
+        """
+        Get the output of the model for a given batch.
+
+        Args:
+            model (Module): The model to use for inference.
+            weights (Iterable[Tensor]): The weights of the model.
+            buffers (Iterable[Tensor]): The buffers of the model.
+            bmg: The batch data.
+            labels (Tensor): The labels for the batch.
+
+        Returns:
+            Tensor: The output of the model.
+        """
+        # Functional call to get the output
+        probs = ch.func.functional_call(
+            model,
+            (params, buffers),
+            kwargs={"bmg": bmg}
+        )
+
+        # Clamp output to avoid numerical issues
+        probs = probs.squeeze(-1)      
+
+        # 2) clamp & invert to get the logits for class 1
+        eps   = 1e-6
+        probs = probs.clamp(min=eps, max=1-eps)
+        logit1 = ch.logit(probs, eps=eps)  # → log(p / (1-p)), shape [B]
+
+        # 3) compute signed margin and sum
+        y       = labels.squeeze(-1).float()       # 0. or 1., shape [B]
+        sign    = 2*y - 1                         # +1 if y=1, -1 if y=0
+        margins = logit1 * sign   
+
+        return margins
+
+    def get_out_to_loss_grad(self,
+                   model: Module,
+                   params: Iterable[ch.Tensor],      # Renamed weights to params for clarity
+                   buffers: Iterable[ch.Tensor],
+                   bmg,
+                   labels: Tensor,
+                   ) -> ch.Tensor:
+
+        probs = ch.func.functional_call(
+            model,
+            (params, buffers),
+            kwargs={"bmg": bmg}
+        )
+        # → [B, 1]
+        probs = probs.squeeze(-1).clamp(min=1e-6, max=1-1e-6)                # → [B]
+
+        # 2) compute 1 - p_correct in one go
+        y_float = labels.squeeze(-1).float()                                 # → [B]
+        out    = (y_float - probs).abs().unsqueeze(-1)     
+
+        return out  
+
+class SmilesTransformerClassificationModelOutput(AbstractModelOutput):
+    """
+    Implements TRAK's AbstractModelOutput for SmilesTransformer binary classification.
+    Assumes the model outputs raw logits of shape (batch_size, 2) for binary classification.
+    The standard training loss is Cross-Entropy Loss.
+    Defines the model output function f(z; theta) = logit_correct - logit_incorrect.
+    The corresponding output-to-loss gradient dL/df = sigmoid(logit_correct) - y
+    """
+    def __init__(self) -> None:
+        """Initializes the SmilesTransformerClassificationModelOutput."""
+        super().__init__()
+    def get_output(self,
+                model: Module,
+                params: Iterable[ch.Tensor],
+                buffers: Iterable[ch.Tensor],
+                xid,  # tokenized SMILES input
+                labels: Tensor,
+                ) -> ch.Tensor:
+        """
+        Compute the margin using normalized logits (via softmax round-trip).
+        
+        This ensures consistent magnitude across different logit scales by:
+        1. Convert logits → probabilities (softmax)
+        2. Convert probabilities → log-probabilities (log)
+        3. Compute margin from log-probabilities
+        
+        Returns:
+            Tensor: Margins of shape (batch_size,)
+        """
+        # Get logits from model
+        logits = ch.func.functional_call(
+            model,
+            (params, buffers),
+            args=(xid,)  # pass xid as input
+        )  # Shape: (batch_size, 2)
+        
+        # Convert to probabilities (normalizes the logits)
+        probs = ch.softmax(logits, dim=1)  # Shape: (batch_size, 2)
+        
+        # Convert back to log-probabilities (normalized logits)
+        # Clamp to avoid log(0)
+        eps = 1e-6
+        probs = probs.clamp(min=eps, max=1-eps)
+        log_probs = ch.log(probs)  # Shape: (batch_size, 2)
+        
+        log_prob_0 = log_probs[:, 0]  # log P(class 0)
+        log_prob_1 = log_probs[:, 1]  # log P(class 1)
+        
+        # Compute margin: log_prob_correct - log_prob_incorrect
+        y = labels.squeeze().long()  # Shape: (batch_size,)
+        
+        # When y=1: margin = log_prob_1 - log_prob_0
+        # When y=0: margin = log_prob_0 - log_prob_1
+        margin = (2 * y - 1) * (log_prob_1 - log_prob_0)
+        
+        return margin
+    def get_out_to_loss_grad(self,
+                model: Module,
+                params: Iterable[ch.Tensor],
+                buffers: Iterable[ch.Tensor],
+                xid,  # tokenized SMILES input
+                labels: Tensor,
+                ) -> ch.Tensor:
+        """
+        Compute gradient of loss w.r.t. margin.
+        
+        For cross-entropy loss with margin m = logit_correct - logit_incorrect:
+        ∂L/∂m = -p_incorrect = -(1 - p_correct)
+        
+        Returns:
+            Tensor: Gradient of shape (batch_size, 1)
+        """
+        # Get logits from model
+        logits = ch.func.functional_call(
+            model,
+            (params, buffers),
+            args=(xid,)
+        )  # Shape: (batch_size, 2)
+        
+        # Convert to probabilities
+        probs = ch.softmax(logits, dim=1)  # Shape: (batch_size, 2)
+        
+        p_positive_class = probs[:, 1]  # Probability of class 1
+
+        y_float = labels.squeeze().float()  # Shape: (batch_size,)
+
+        out = (y_float - p_positive_class).abs().unsqueeze(-1)  # Shape: (batch_size, 1)
+
+        return out
+
 TASK_TO_MODELOUT = {
     "image_classification": ImageClassificationModelOutput,
     "clip": CLIPModelOutput,
     "text_classification": TextClassificationModelOutput,
     "iterative_image_classification": IterativeImageClassificationModelOutput,
+    "chemprop_classification": ChempropClassificationModelOutput,
+    "smilestransformer_classification": SmilesTransformerClassificationModelOutput
 }
+

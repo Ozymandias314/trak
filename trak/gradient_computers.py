@@ -263,3 +263,170 @@ class IterativeGradientComputer(AbstractGradientComputer):
                 The gradient of the loss with respect to the model output.
         """
         return self.modelout_fn.get_out_to_loss_grad(self.model, None, None, batch)
+
+
+class JacRevGradientComputer(AbstractGradientComputer):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        task: AbstractModelOutput,
+        grad_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        grad_wrt: Optional[Iterable[str]] = None,
+    ) -> None:
+        super().__init__(model, task, grad_dim, dtype, device)
+        self.model = model
+        self.num_params = get_num_params(self.model)
+        self.load_model_params(model)
+        self.grad_wrt = grad_wrt
+        self.logger = logging.getLogger("GradientComputer")
+        #assert that self.task is chemprop_classification
+        #assert task == "chemprop_classification", "JacRevGradientComputer only supports chemprop_classification task"
+    
+    def load_model_params(self, model) -> None:
+        """Given a a torch.nn.Module model, inits/updates the (functional)
+        weights and buffers. See https://pytorch.org/docs/stable/func.html
+        for more details on :code:`torch.func`'s functional models.
+
+        Args:
+            model (torch.nn.Module):
+                model to load
+
+        """
+        self.func_weights = dict(model.named_parameters())
+        self.func_buffers = dict(model.named_buffers())
+    
+    def compute_per_sample_grad(self, batch):
+
+        bmg = batch.bmg
+        labels = batch.Y
+
+        grads = torch.func.jacrev(
+            self.modelout_fn.get_output, has_aux=False, argnums=1
+        )(self.model, self.func_weights, self.func_buffers, bmg, labels)
+
+        if self.grad_wrt is not None:
+            for param_name in list(grads.keys()):
+                if param_name not in self.grad_wrt:
+                    del grads[param_name]
+        return grads
+    
+
+
+    def compute_loss_grad(self, batch) -> Tensor:
+        """Computes the gradient of the loss with respect to the model output
+
+        .. math::
+
+            \\partial \\ell / \\partial \\text{(model output)}
+
+        Note: For all applications we considered, we analytically derived the
+        out-to-loss gradient, thus avoiding the need to do any backward passes
+        (let alone per-sample grads). If for your application this is not feasible,
+        you'll need to subclass this and modify this method to have a structure
+        similar to the one of :meth:`FunctionalGradientComputer:.get_output`,
+        i.e. something like:
+
+        .. code-block:: python
+
+            grad_out_to_loss = grad(self.model_out_to_loss_grad, ...)
+            grads = vmap(grad_out_to_loss, ...)
+            ...
+
+        Args:
+            batch (Iterable[Tensor]):
+                batch of data
+
+        Returns:
+            Tensor:
+                The gradient of the loss with respect to the model output.
+        """
+        return self.modelout_fn.get_out_to_loss_grad(
+            self.model, self.func_weights, self.func_buffers, batch.bmg, batch.Y
+        )
+    
+
+
+
+class JacRevGradientComputerForSmilesTransformer(AbstractGradientComputer):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        task: AbstractModelOutput,
+        grad_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        grad_wrt: Optional[Iterable[str]] = None,
+    ) -> None:
+        super().__init__(model, task, grad_dim, dtype, device)
+        self.model = model
+        self.num_params = get_num_params(self.model)
+        self.load_model_params(model)
+        self.grad_wrt = grad_wrt
+        self.logger = logging.getLogger("GradientComputer")
+        #assert that self.task is chemprop_classification
+        #assert task == "chemprop_classification", "JacRevGradientComputer only supports chemprop_classification task"
+    
+    def load_model_params(self, model) -> None:
+        """Given a a torch.nn.Module model, inits/updates the (functional)
+        weights and buffers. See https://pytorch.org/docs/stable/func.html
+        for more details on :code:`torch.func`'s functional models.
+
+        Args:
+            model (torch.nn.Module):
+                model to load
+
+        """
+        self.func_weights = dict(model.named_parameters())
+        self.func_buffers = dict(model.named_buffers())
+    
+    def compute_per_sample_grad(self, batch):
+
+        xid = batch[0]
+        labels = batch[1]
+        grads = torch.func.jacrev(
+            self.modelout_fn.get_output, has_aux=False, argnums=1
+        )(self.model, self.func_weights, self.func_buffers, xid, labels)
+
+        if self.grad_wrt is not None:
+            for param_name in list(grads.keys()):
+                if param_name not in self.grad_wrt:
+                    del grads[param_name]
+        return grads
+    
+
+
+    def compute_loss_grad(self, batch) -> Tensor:
+        """Computes the gradient of the loss with respect to the model output
+
+        .. math::
+
+            \\partial \\ell / \\partial \\text{(model output)}
+
+        Note: For all applications we considered, we analytically derived the
+        out-to-loss gradient, thus avoiding the need to do any backward passes
+        (let alone per-sample grads). If for your application this is not feasible,
+        you'll need to subclass this and modify this method to have a structure
+        similar to the one of :meth:`FunctionalGradientComputer:.get_output`,
+        i.e. something like:
+
+        .. code-block:: python
+
+            grad_out_to_loss = grad(self.model_out_to_loss_grad, ...)
+            grads = vmap(grad_out_to_loss, ...)
+            ...
+
+        Args:
+            batch (Iterable[Tensor]):
+                batch of data
+
+        Returns:
+            Tensor:
+                The gradient of the loss with respect to the model output.
+        """
+        return self.modelout_fn.get_out_to_loss_grad(
+            self.model, self.func_weights, self.func_buffers, batch[0], batch[1]
+        )
+    
+
